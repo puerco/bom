@@ -179,6 +179,11 @@ func OpenDoc(path string) (*Document, error) {
 			if value != NONE {
 				currentObject.(*File).LicenseInfoInFile = value
 			}
+		case "FileType":
+			if currentObject.(*File).FileType == nil {
+				currentObject.(*File).FileType = []string{}
+			}
+			currentObject.(*File).FileType = append(currentObject.(*File).FileType, value)
 		case "FileChecksum", "PackageChecksum":
 			// Checksums are also tag/value -> algo/hash
 			match := tagRegExp.FindStringSubmatch(value)
