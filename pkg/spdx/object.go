@@ -50,6 +50,7 @@ type Object interface {
 	ToProvenanceSubject() *intoto.Subject
 	getProvenanceSubjects(opts *ProvenanceOptions, seen *map[string]struct{}) []intoto.Subject
 	GetElementByID(string) Object
+	Dependencies(...RelationshipType) ([]Object, error)
 }
 
 type Entity struct {
@@ -279,3 +280,36 @@ mloop:
 
 // GetElementByID nil function to be overridden by package and file
 func (e *Entity) GetElementByID(string) Object { return nil }
+
+// Dependencies returns packages and files which are related as dependencies
+// to the entity. Once current challenge of this method is that it would
+// need to take into account other elements, marked as DEPENDENCY_OF
+// which is the inverse of the default DEPENDS_ON we are using here.
+//
+// The relationships types that can be treated as dependencies can be
+// customized.
+func (e *Entity) Dependencies(relationships ...RelationshipType) (deps []Object, err error) {
+	if len(relationships) == 0 {
+		relationships = []RelationshipType{DEPENDS_ON}
+	}
+	// Make an inverse dict to check the valid ones
+	validRelationships := map[RelationshipType]*bool{}
+	for _, r := range relationships {
+		validRelationships[r] = nil
+	}
+
+	deps = []Object{}
+	rels := e.GetRelationships()
+	for _, r := range *rels {
+		if _, ok := validRelationships[r.Type]; ok {
+			if r.Peer != nil {
+				deps = append(deps, r.Peer)
+			} else {
+				logrus.Warnf(
+					"Not adding dependency %s, not created", r.PeerReference,
+				)
+			}
+		}
+	}
+	return deps, nil
+}

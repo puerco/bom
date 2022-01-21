@@ -202,12 +202,16 @@ func (f *File) GetElementByID(id string) Object {
 }
 
 func (f *File) LicenseData() (FileLicenseData, error) {
+	deps, err := f.Dependencies()
+	if err != nil {
+		return FileLicenseData{}, errors.Wrap(err, "getting package dependencies")
+	}
 	return FileLicenseData{
 		Name:              f.FileName,
 		ID:                f.ID,
 		LicenseConcluded:  []string{f.LicenseConcluded},
 		LicenseInfoInFile: []string{f.LicenseInfoInFile},
-		NumDependencies:   0,
+		NumDependencies:   len(deps),
 		NumLicenses:       0,
 	}, nil
 }
