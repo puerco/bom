@@ -200,3 +200,14 @@ func (f *File) GetElementByID(id string) Object {
 	}
 	return recursiveSearch(id, f, &map[string]struct{}{})
 }
+
+func (f *File) LicenseData() (FileLicenseData, error) {
+	return FileLicenseData{
+		Name:              f.FileName,
+		ID:                f.ID,
+		LicenseConcluded:  []string{f.LicenseConcluded},
+		LicenseInfoInFile: []string{f.LicenseInfoInFile},
+		NumDependencies:   0,
+		NumLicenses:       0,
+	}, nil
+}

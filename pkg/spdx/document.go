@@ -566,3 +566,50 @@ func (d *Document) ValidateFiles(filePaths []string) ([]ValidationResults, error
 	}
 	return results, e
 }
+
+type LicenseData struct {
+	Packages []PackageLicenseData
+	Files    []FileLicenseData
+}
+
+type PackageLicenseData struct {
+	Name             string
+	ID               string
+	LicenseConcluded []string
+	LicenseDeclared  []string
+	NumDependencies  int
+	NumLicenses      int
+}
+
+type FileLicenseData struct {
+	Name              string
+	ID                string
+	LicenseConcluded  []string
+	LicenseInfoInFile []string
+	NumDependencies   int
+	NumLicenses       int
+}
+
+// LicenseData returns a data structure data with licensing information from
+// the SBOMs components.
+func (d *Document) LicenseData() (*LicenseData, error) {
+	ld := &LicenseData{}
+	// Add the license data for all packages
+	for _, p := range d.Packages {
+		d, err := p.LicenseData()
+		if err != nil {
+			return nil, errors.Wrapf(err, "while getting license data from %s", p.SPDXID())
+		}
+		ld.Packages = append(ld.Packages, d)
+	}
+
+	// Add the license information for all files
+	for _, f := range d.Files {
+		d, err := f.LicenseData()
+		if err != nil {
+			return nil, errors.Wrapf(err, "while getting license data from %s", f.SPDXID())
+		}
+		ld.Files = append(ld.Files, d)
+	}
+	return ld, nil
+}

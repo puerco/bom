@@ -408,3 +408,16 @@ func (p *Package) GetElementByID(id string) Object {
 	}
 	return recursiveSearch(id, p, &map[string]struct{}{})
 }
+
+// LicenseData returns a data structure with the package license
+// information, including known dependencies
+func (p *Package) LicenseData() (PackageLicenseData, error) {
+	return PackageLicenseData{
+		Name:             p.Name,
+		ID:               p.ID,
+		LicenseConcluded: []string{p.LicenseConcluded}, // Currently we dont support more than 1 lic
+		LicenseDeclared:  []string{p.LicenseDeclared},
+		NumDependencies:  0,
+		NumLicenses:      0,
+	}, nil
+}
