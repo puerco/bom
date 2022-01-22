@@ -68,12 +68,54 @@ func runLicense(opts *licenseOptions, args []string) error {
 
 	if opts.Format == "table" {
 		fmt.Println(spdx.Banner())
-		return licenseTable(opts, doc)
+		if len(args) > 1 {
+			return elementLicenseTable(opts, doc, args[1])
+		}
+
+		return documentLicenseTable(opts, doc)
 	}
 	return errors.New("Unknown format")
 }
 
-func licenseTable(_ *licenseOptions, doc *spdx.Document) error {
+func elementLicenseTable(_ *licenseOptions, doc *spdx.Document, elementID string) error {
+	var p *spdx.Package
+	for _, pt := range doc.Packages {
+		if pt.SPDXID() == elementID {
+			p = pt
+			break
+		}
+	}
+	if p == nil {
+		return errors.Errorf("Unable to find package %s", elementID)
+	}
+	data := [][]string{}
+	deps, err := p.Dependencies()
+	if err != nil {
+		return errors.Wrap(err, "getting package dependencies")
+	}
+	for _, d := range deps {
+		if p, ok := d.(*spdx.Package); ok {
+			l := spdx.NOASSERTION
+			if p.LicenseConcluded != spdx.NOASSERTION {
+				l = p.LicenseConcluded
+			}
+
+			if p.LicenseDeclared != "" && p.LicenseDeclared != spdx.NOASSERTION {
+				l = p.LicenseDeclared
+			}
+			data = append(data, []string{p.Name, l})
+		}
+	}
+	table := tablewriter.NewWriter(os.Stdout)
+	table.SetHeader([]string{"Package", "License"})
+	table.SetBorder(true)
+	table.AppendBulk(data)
+	table.Render()
+
+	return nil
+}
+
+func documentLicenseTable(_ *licenseOptions, doc *spdx.Document) error {
 	sbomData, err := doc.LicenseData()
 	if err != nil {
 		return errors.Wrap(err, "getting license information")
