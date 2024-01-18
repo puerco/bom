@@ -9,7 +9,7 @@ require (
 	github.com/google/licenseclassifier/v2 v2.0.0
 	github.com/google/uuid v1.5.0
 	github.com/in-toto/in-toto-golang v0.9.0
-	github.com/knqyf263/go-rpmdb v0.0.0-20230723082926-067d98befa60
+	github.com/knqyf263/go-rpmdb v0.0.0-20231206071317-a8af76a6220f
 	github.com/nozzle/throttler v0.0.0-20180817012639-2ea982251481
 	github.com/sirupsen/logrus v1.9.3
 	github.com/spf13/cobra v1.8.0
