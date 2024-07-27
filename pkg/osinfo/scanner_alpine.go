@@ -22,6 +22,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/protobom/protobom/pkg/sbom"
 	"github.com/sirupsen/logrus"
 	apk "gitlab.alpinelinux.org/alpine/go/repository"
 )
@@ -91,11 +92,11 @@ func (ct *alpineScanner) ParseDB(dbPath string) (*[]PackageDBEntry, error) {
 
 	packages := []PackageDBEntry{}
 	for _, p := range apks {
-		cs := map[string]string{}
+		cs := map[int32]string{}
 		if strings.HasPrefix(p.ChecksumString(), "Q1") {
-			cs["SHA1"] = hex.EncodeToString(p.Checksum)
+			cs[int32(sbom.HashAlgorithm_SHA1)] = hex.EncodeToString(p.Checksum)
 		} else if p.ChecksumString() != "" {
-			cs["MD5"] = hex.EncodeToString(p.Checksum)
+			cs[int32(sbom.HashAlgorithm_MD5)] = hex.EncodeToString(p.Checksum)
 		}
 
 		packages = append(packages, PackageDBEntry{

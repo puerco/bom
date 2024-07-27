@@ -25,21 +25,18 @@ package spdx
 
 import (
 	"bytes"
-	"crypto/sha1"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"html/template"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	purl "github.com/package-url/packageurl-go"
+	"github.com/protobom/protobom/pkg/sbom"
+	"github.com/protobom/protobom/pkg/writer"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/term"
 
@@ -87,37 +84,8 @@ const (
 	MessageHashMismatch = "Hash mismatch"
 )
 
-// Document abstracts the SPDX document.
 type Document struct {
-	Version     string // SPDX-2.2
-	DataLicense string // CC0-1.0
-	ID          string // SPDXRef-DOCUMENT
-	Name        string // hello-go-src
-	Namespace   string // https://swinslow.net/spdx-examples/example6/hello-go-src-v1
-	Creator     struct {
-		Person       string // Steve Winslow (steve@swinslow.net)
-		Organization string
-		Tool         []string // github.com/spdx/tools-golang/builder
-	}
-	Created            time.Time // 2020-11-24T01:12:27Z
-	LicenseListVersion string
-	Packages           map[string]*Package
-	Files              map[string]*File      // List of files
-	ExternalDocRefs    []ExternalDocumentRef // List of related external documents
-}
-
-// ExternalDocumentRef is a pointer to an external, related document.
-type ExternalDocumentRef struct {
-	ID        string            `yaml:"id"`        // Identifier for the external doc (eg "external-source-bom")
-	URI       string            `yaml:"uri"`       // URI where the doc can be retrieved
-	Checksums map[string]string `yaml:"checksums"` // Document checksums
-}
-
-// Example: cpe23Type cpe:2.3:a:base-files:base-files:10.3+deb10u9:*:*:*:*:*:*:*.
-type ExternalRef struct {
-	Category string // SECURITY | PACKAGE-MANAGER | PERSISTENT-ID | OTHER
-	Type     string // cpe22Type | cpe23Type | maven-central | npm | nuget | bower | purl | swh | other
-	Locator  string // unique string with no spaces
+	*sbom.Document
 }
 
 type DrawingOptions struct {
@@ -164,43 +132,24 @@ func (ed *ExternalDocumentRef) ReadSourceFile(path string) error {
 
 // NewDocument returns a new SPDX document with some defaults preloaded.
 func NewDocument() *Document {
+	doc := sbom.NewDocument()
+	doc.Metadata.Tools = append(doc.Metadata.Tools, &sbom.Tool{
+		Name:    "bom",
+		Version: version.GetVersionInfo().GitVersion,
+		Vendor:  "Kubernetes Release Engineering",
+	})
 	return &Document{
-		ID:          "SPDXRef-DOCUMENT",
-		Version:     "SPDX-2.3",
-		DataLicense: "CC0-1.0",
-		Created:     time.Now().UTC(),
-		Creator: struct {
-			Person       string
-			Organization string
-			Tool         []string
-		}{
-			Person:       defaultDocumentAuthor,
-			Organization: "Kubernetes Release Engineering",
-			Tool: []string{
-				fmt.Sprintf("%s-%s", "bom", version.GetVersionInfo().GitVersion),
-			},
-		},
+		Document: doc,
 	}
 }
 
-// AddPackage adds a new empty package to the document.
-func (d *Document) AddPackage(pkg *Package) error {
-	if d.Packages == nil {
-		d.Packages = map[string]*Package{}
+// AddPackage adds a new empty package to the document
+func (d *Document) AddPackage(pkg *sbom.Node) error {
+	if pkg.Id == "" {
+		pkg.Id = uuid.NewString()
 	}
 
-	if pkg.SPDXID() == "" {
-		pkg.BuildID(pkg.Name)
-		d.ensureUniqueElementID(pkg)
-	}
-	if pkg.SPDXID() == "" {
-		return errors.New("package ID is needed to add a new package")
-	}
-	if _, ok := d.Packages[pkg.SPDXID()]; ok {
-		return fmt.Errorf("a package with ID %s already exists in the document", pkg.SPDXID())
-	}
-
-	d.Packages[pkg.SPDXID()] = pkg
+	d.NodeList.AddNode(pkg)
 	return nil
 }
 
@@ -217,86 +166,112 @@ func (d *Document) Write(path string) error {
 	return nil
 }
 
-// Render reders the spdx manifest.
-func (d *Document) Render() (doc string, err error) {
-	var buf bytes.Buffer
-	funcMap := template.FuncMap{
-		// The name "title" is what the function will be called in the template text.
-		"dateFormat":   func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05Z") },
-		"extDocFormat": func(ed ExternalDocumentRef) string { logrus.Infof("External doc: %s", ed.ID); return ed.String() },
-	}
-
-	if d.Name == "" {
-		d.Name = "SBOM-SPDX-" + uuid.New().String()
-		logrus.Warnf("Document has no name defined, automatically set to " + d.Name)
-	}
-
-	tmpl, err := template.New("document").Funcs(funcMap).Parse(docTemplate)
-	if err != nil {
-		log.Fatalf("parsing: %s", err)
-	}
-
-	// Run the template to verify the output.
-	if err := tmpl.Execute(&buf, d); err != nil {
-		return "", fmt.Errorf("executing spdx document template: %w", err)
-	}
-
-	doc = buf.String()
-
-	// List files in the document. Files listed directly on the
-	// document do not contain relationships yet.
-	filesDescribed := ""
-	if len(d.Files) > 0 {
-		doc += "\n##### Files independent of packages\n\n"
-		filesDescribed = "\n"
-	}
-
-	for _, file := range d.Files {
-		fileDoc, err := file.Render()
-		if err != nil {
-			return "", fmt.Errorf("rendering file "+file.Name+" :%w", err)
-		}
-		doc += fileDoc
-		filesDescribed += fmt.Sprintf("Relationship: %s DESCRIBES %s\n\n", d.ID, file.ID)
-	}
-	doc += filesDescribed
-
-	// Cycle all packages and get their data
-	for _, pkg := range d.Packages {
-		pkgDoc, err := pkg.Render()
-		if err != nil {
-			return "", fmt.Errorf("rendering pkg "+pkg.Name+" :%w", err)
-		}
-
-		doc += pkgDoc
-		doc += fmt.Sprintf("Relationship: %s DESCRIBES %s\n\n", d.ID, pkg.ID)
-	}
-
-	return doc, err
+type bufCloser struct {
+	bytes.Buffer
 }
 
-// AddFile adds a file contained in the package.
-func (d *Document) AddFile(file *File) error {
-	if d.Files == nil {
-		d.Files = map[string]*File{}
+func (bufCloser) Close() error {
+	return nil
+}
+
+// Render reders the spdx manifest
+func (d *Document) Render() (doc string, err error) {
+	w := writer.New()
+	var b bufCloser
+	if err := w.WriteStream(d.Document, &b); err != nil {
+		return "", fmt.Errorf("buffering SBOM string: %w", err)
 	}
+	return b.String(), nil
+	/*
+		var buf bytes.Buffer
+		funcMap := template.FuncMap{
+			// The name "title" is what the function will be called in the template text.
+			"dateFormat":   func(t time.Time) string { return t.UTC().Format("2006-01-02T15:04:05Z") },
+			"extDocFormat": func(ed ExternalDocumentRef) string { logrus.Infof("External doc: %s", ed.ID); return ed.String() },
+		}
+
+		if d.Name == "" {
+			d.Name = "SBOM-SPDX-" + uuid.New().String()
+			logrus.Warnf("Document has no name defined, automatically set to " + d.Name)
+		}
+
+		tmpl, err := template.New("document").Funcs(funcMap).Parse(docTemplate)
+		if err != nil {
+			log.Fatalf("parsing: %s", err)
+		}
+
+		// Run the template to verify the output.
+		if err := tmpl.Execute(&buf, d); err != nil {
+			return "", fmt.Errorf("executing spdx document template: %w", err)
+		}
+
+		doc = buf.String()
+
+		// List files in the document. Files listed directly on the
+		// document do not contain relationships yet.
+		filesDescribed := ""
+		if len(d.Files) > 0 {
+			doc += "\n##### Files independent of packages\n\n"
+			filesDescribed = "\n"
+		}
+
+		for _, file := range d.Files {
+			fileDoc, err := file.Render()
+			if err != nil {
+				return "", fmt.Errorf("rendering file "+file.Name+" :%w", err)
+			}
+			doc += fileDoc
+			filesDescribed += fmt.Sprintf("Relationship: %s DESCRIBES %s\n\n", d.ID, file.ID)
+		}
+		doc += filesDescribed
+
+		// Cycle all packages and get their data
+		for _, pkg := range d.Packages {
+			pkgDoc, err := pkg.Render()
+			if err != nil {
+				return "", fmt.Errorf("rendering pkg "+pkg.Name+" :%w", err)
+			}
+
+			doc += pkgDoc
+			doc += fmt.Sprintf("Relationship: %s DESCRIBES %s\n\n", d.ID, pkg.ID)
+		}
+
+		return doc, err
+	*/
+}
+
+// AddFile adds a file contained in the package
+func (d *Document) AddFile(file *sbom.Node) error {
 	// If file does not have an ID, we try to build one
 	// by hashing the file name
-	if file.ID == "" {
-		if file.Name == "" {
-			return errors.New("unable to generate file ID, filename not set")
-		}
-		if d.Name == "" {
-			return errors.New("unable to generate file ID, filename not set")
-		}
-		h := sha1.New()
-		if _, err := h.Write([]byte(d.Name + ":" + file.Name)); err != nil {
-			return fmt.Errorf("getting sha1 of filename: %w", err)
-		}
-		file.ID = "SPDXRef-File-" + hex.EncodeToString(h.Sum(nil))
+	if file.Id == "" {
+		file.Id = uuid.NewString()
 	}
-	d.ensureUniqueElementID(file)
-	d.Files[file.ID] = file
+
+	if file.Name != "" && util.Exists(file.Name) {
+		if _, ok := file.Hashes[int32(sbom.HashAlgorithm_SHA1)]; !ok {
+			h, err := hash.SHA1ForFile(file.Name)
+			if err != nil {
+				return fmt.Errorf("hashing file: %w", err)
+			}
+			file.Hashes[int32(sbom.HashAlgorithm_SHA1)] = h
+		}
+		if _, ok := file.Hashes[int32(sbom.HashAlgorithm_SHA256)]; !ok {
+			h, err := hash.SHA256ForFile(file.Name)
+			if err != nil {
+				return fmt.Errorf("hashing file: %w", err)
+			}
+			file.Hashes[int32(sbom.HashAlgorithm_SHA256)] = h
+		}
+		if _, ok := file.Hashes[int32(sbom.HashAlgorithm_SHA512)]; !ok {
+			h, err := hash.SHA512ForFile(file.Name)
+			if err != nil {
+				return fmt.Errorf("hashing file: %w", err)
+			}
+			file.Hashes[int32(sbom.HashAlgorithm_SHA512)] = h
+		}
+	}
+	d.NodeList.AddNode(file)
 	return nil
 }
 
@@ -317,9 +292,9 @@ func treeLines(o *DrawingOptions, depth int, connector string) string {
 func (d *Document) Outline(o *DrawingOptions) (outline string, err error) {
 	seen := map[string]struct{}{}
 	builder := &strings.Builder{}
-	title := d.ID
-	if d.Name != "" {
-		title = d.Name
+	title := d.Metadata.Id
+	if d.Metadata.Name != "" {
+		title = d.Metadata.Name
 	}
 	fmt.Fprintf(builder, " 📂 SPDX Document %s\n", title)
 	fmt.Fprintln(builder, treeLines(o, 0, ""))
@@ -479,6 +454,11 @@ func (d *Document) ensureUniquePeerIDs(rels *[]*Relationship) {
 // GetPackageByID queries the packages to search for a specific entity by name
 // note that this method returns a copy of the entity if found.
 func (d *Document) GetElementByID(id string) Object {
+	n := d.NodeList.GetNodeByID(id)
+	if n != nil {
+		return Object{}
+	}
+	return nil
 	seen := map[string]struct{}{}
 	for _, p := range d.Packages {
 		if sub := recursiveIDSearch(id, p, &seen); sub != nil {

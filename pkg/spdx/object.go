@@ -29,6 +29,7 @@ import (
 
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	purl "github.com/package-url/packageurl-go"
+	"github.com/protobom/protobom/pkg/sbom"
 	"github.com/sirupsen/logrus"
 
 	"sigs.k8s.io/release-utils/hash"
@@ -98,8 +99,25 @@ func (e *Entity) AddRelationship(rel *Relationship) {
 	e.Relationships = append(e.Relationships, rel)
 }
 
-// ReadChecksums receives a path to a file and calculates its checksums.
-func (e *Entity) ReadChecksums(filePath string) error {
+// readChecksums populates the hashes of a node from a file path
+func readChecksums(node *sbom.Node, filePath string) error {
+	// Hash the file contents
+	for algo, fn := range map[sbom.HashAlgorithm]func(string) (string, error){
+		sbom.HashAlgorithm_SHA1:   hash.SHA1ForFile,
+		sbom.HashAlgorithm_SHA256: hash.SHA256ForFile,
+		sbom.HashAlgorithm_SHA512: hash.SHA512ForFile,
+	} {
+		csum, err := fn(filePath)
+		if err != nil {
+			return fmt.Errorf("hashing %s file %s: %w", algo, filePath, err)
+		}
+		node.Hashes[int32(algo)] = csum
+	}
+	return nil
+}
+
+// ReadChecksums receives a path to a file and calculates its checksums
+func (e *Entity) readChecksums(filePath string) error {
 	if e.Checksum == nil {
 		e.Checksum = map[string]string{}
 	}

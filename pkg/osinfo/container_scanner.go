@@ -106,7 +106,7 @@ type PackageDBEntry struct {
 	MaintainerEmail string
 	HomePage        string
 	License         string // License expression
-	Checksums       map[string]string
+	Checksums       map[int32]string
 }
 
 // PackageURL returns a purl representing the db entry. If the entry

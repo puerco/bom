@@ -42,6 +42,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/nozzle/throttler"
 	purl "github.com/package-url/packageurl-go"
+	"github.com/protobom/protobom/pkg/sbom"
 	"github.com/sirupsen/logrus"
 
 	"sigs.k8s.io/release-utils/util"
@@ -441,7 +442,7 @@ func createReferenceArchive(digest, path string) (tarPath string, err error) {
 // PackageFromTarball builds a SPDX package from the contents of a tarball.
 func (di *spdxDefaultImplementation) PackageFromTarball(
 	opts *Options, tarOpts *TarballOptions, tarFile string,
-) (pkg *Package, err error) {
+) (pkg *sbom.NodeList, err error) {
 	logrus.Debugf("Generating SPDX package from tarball %s", tarFile)
 
 	if tarOpts.AddFiles {
@@ -456,12 +457,19 @@ func (di *spdxDefaultImplementation) PackageFromTarball(
 			return nil, fmt.Errorf("generating package from tar contents: %w", err)
 		}
 	} else {
-		pkg = NewPackage()
+		pkg = sbom.NewNodeList()
+		n := sbom.NewNode()
+		n.Id = uuid.NewString()
+		pkg.AddRootNode(n)
 	}
+	pkg.GetNodeByID(pkg.RootElements[0]).Type = sbom.Node_FILE
+	pkg.GetNodeByID(pkg.RootElements[0]).Name = tarFile
+
 	// Set the extract dir option. This makes the package to remove
 	// the tempdir prefix from the document paths:
-	pkg.Options().WorkDir = tarOpts.ExtractDir
-	if err := pkg.ReadSourceFile(tarFile); err != nil {
+	//pkg.Options().WorkDir = tarOpts.ExtractDir
+
+	if err := readChecksums(pkg.GetNodeByID(pkg.RootElements[0]), tarFile); err != nil {
 		return nil, fmt.Errorf("reading source file %s: %w", tarFile, err)
 	}
 	// Build the ID and the filename from the tarball name
@@ -561,8 +569,7 @@ func (di *spdxDefaultImplementation) ApplyIgnorePatterns(
 // GetGoDependencies opens a Go module and directory and returns the
 // dependencies as SPDX packages.
 func (di *spdxDefaultImplementation) GetGoDependencies(
-	path string, opts *Options,
-) (spdxPackages []*Package, err error) {
+	path string, opts *Options) ([]*sbom.Node, error) {
 	// Open the directory as a go module:
 	mod, err := NewGoModuleFromPath(path)
 	if err != nil {
@@ -589,7 +596,7 @@ func (di *spdxDefaultImplementation) GetGoDependencies(
 		}
 	}
 
-	spdxPackages = []*Package{}
+	spdxPackages := []*sbom.Node{}
 	for _, goPkg := range mod.Packages {
 		spdxPkg, err := goPkg.ToSPDXPackage()
 		if err != nil {
@@ -691,8 +698,8 @@ func (*spdxDefaultImplementation) purlFromImage(img *ImageReferenceInfo) string 
 	return strings.Replace(packageurl.String(), "@sha256:", "@sha256%3A", 1)
 }
 
-// ImageRefToPackage Returns a spdx package from an OCI image reference.
-func (di *spdxDefaultImplementation) ImageRefToPackage(ref string, opts *Options) (*Package, error) {
+// ImageRefToPackage Returns a spdx package from an OCI image reference
+func (di *spdxDefaultImplementation) ImageRefToPackage(ref string, opts *Options) (*sbom.NodeList, error) {
 	tmpdir, err := os.MkdirTemp("", "doc-build-")
 	if err != nil {
 		return nil, fmt.Errorf("creating temporary workdir in: %w", err)
@@ -714,21 +721,21 @@ func (di *spdxDefaultImplementation) ImageRefToPackage(ref string, opts *Options
 	// reference, return a single package:
 	if len(references.Images) == 0 {
 		logrus.Infof("Generating single image package for %s", ref)
-		p, err := di.referenceInfoToPackage(opts, references)
+		p, err := di.referenceInfoToNodeList(opts, references)
 		if err != nil {
 			return nil, fmt.Errorf("generating image package: %w", err)
 		}
 
 		// Rebuild the ID to compose it with the parent element
-		p.Name = topDigest.DigestStr()
-		p.BuildID(p.Name)
+		p.GetNodeByID(p.RootElements[0]).Name = topDigest.DigestStr()
 
 		return p, nil
 	}
 
 	// Create the package representing the image tag:
 	logrus.Infof("Generating SBOM for multiarch image %s", references.Digest)
-	pkg := &Package{}
+	pkg := sbom.NewNodeList()
+	imgNode := sbom.NewNode()
 
 	refString := ""
 	plainRef := ""
@@ -739,55 +746,54 @@ func (di *spdxDefaultImplementation) ImageRefToPackage(ref string, opts *Options
 		refString = fmt.Sprintf("%s@%s", refFull.Context().Name(), topDigest.DigestStr())
 		plainRef = refFull.Context().Name()
 	}
-
-	pkg.Name = refString
-	pkg.BuildID(topDigest.DigestStr())
+	imgNode.Id = sbom.NewNodeIdentifier()
+	imgNode.Name = refString
 
 	if references.Digest != "" {
-		pkg.DownloadLocation = references.Digest
+		imgNode.UrlDownload = references.Digest
 	}
+
+	// Add a the topmost package purl
+	packageurl := di.purlFromImage(references)
+	if packageurl != "" {
+		imgNode.Identifiers[int32(sbom.SoftwareIdentifierType_PURL)] = packageurl
+	}
+
+	pkg.AddRootNode(imgNode)
 
 	// Now, cycle each image in the index and generate a package from it
 	for i := range references.Images {
 		if plainRef != "" {
 			references.Images[i].Reference = plainRef
 		}
-		subpkg, err := di.referenceInfoToPackage(opts, &references.Images[i])
+		subpkg, err := di.referenceInfoToNodeList(opts, &references.Images[i])
 		if err != nil {
-			return nil, fmt.Errorf("generating image package: %w", err)
+			return nil, fmt.Errorf("generating arch image nodelist: %w", err)
 		}
 
-		// Rebuild the ID to compose it with the parent element
-		subpkg.BuildID(pkg.Name, subpkg.Name)
+		// Connect the subpackage to the main image node
+		pkg.Nodes = append(pkg.Nodes, subpkg.Nodes...)
+		pkg.Edges = append(pkg.Edges, subpkg.Edges...)
 
-		// Add the package to the image
-		pkg.AddRelationship(&Relationship{
-			Peer:       subpkg,
-			Type:       CONTAINS,
-			FullRender: true,
-			Comment:    "Container image lager",
+		pkg.Edges = append(pkg.Edges, &sbom.Edge{
+			Type: sbom.Edge_contains,
+			From: imgNode.Id,
+			To:   []string{subpkg.RootElements[0]},
 		})
-		// And add an inverse relationship to the index
-		subpkg.AddRelationship(&Relationship{
-			Peer:    pkg,
-			Type:    VARIANT_OF,
-			Comment: "Image index",
+		pkg.Edges = append(pkg.Edges, &sbom.Edge{
+			Type: sbom.Edge_variant,
+			From: subpkg.RootElements[0],
+			To:   []string{imgNode.Id},
 		})
-	}
 
-	// Add a the topmost package purl
-	packageurl := di.purlFromImage(references)
-	if packageurl != "" {
-		pkg.ExternalRefs = append(pkg.ExternalRefs, ExternalRef{
-			Category: CatPackageManager,
-			Type:     "purl",
-			Locator:  packageurl,
-		})
+		// FIXME(puerco): Add purls for arch variants
 	}
 	return pkg, nil
 }
 
-func (di *spdxDefaultImplementation) referenceInfoToPackage(opts *Options, img *ImageReferenceInfo) (*Package, error) {
+func (di *spdxDefaultImplementation) referenceInfoToNodeList(
+	opts *Options, img *ImageReferenceInfo,
+) (*sbom.NodeList, error) {
 	subpkg, err := di.PackageFromImageTarball(opts, img.Archive)
 	if err != nil {
 		return nil, fmt.Errorf("adding image variant package: %w", err)
@@ -798,29 +804,23 @@ func (di *spdxDefaultImplementation) referenceInfoToPackage(opts *Options, img *
 		return nil, fmt.Errorf("parsing digest %s: %w", img.Digest, err)
 	}
 
-	subpkg.Name = imageDigest.DigestStr()
+	subpkg.GetNodeByID(subpkg.RootElements[0]).Name = imageDigest.DigestStr()
 
 	if img.Reference != "" {
 		imgRef, err := name.ParseReference(img.Reference)
 		if err == nil {
-			subpkg.Name = fmt.Sprintf("%s@%s", imgRef.Context().String(), imageDigest.DigestStr())
+			subpkg.GetNodeByID(subpkg.RootElements[0]).Name = fmt.Sprintf("%s@%s", imgRef.Context().String(), imageDigest.DigestStr())
 		} else {
 			logrus.Errorf("parsing %s: %s", img.Reference, err)
 		}
 	}
 
-	subpkg.Checksum = map[string]string{
-		"SHA256": strings.TrimPrefix(imageDigest.DigestStr(), "sha256:"),
-	}
-	subpkg.FileName = ""
+	subpkg.GetNodeByID(subpkg.RootElements[0]).Hashes[int32(sbom.HashAlgorithm_SHA256)] = strings.TrimPrefix(imageDigest.DigestStr(), "sha256:")
+	subpkg.GetNodeByID(subpkg.RootElements[0]).FileName = ""
 
 	packageurl := di.purlFromImage(img)
 	if packageurl != "" {
-		subpkg.ExternalRefs = append(subpkg.ExternalRefs, ExternalRef{
-			Category: CatPackageManager,
-			Type:     "purl",
-			Locator:  packageurl,
-		})
+		subpkg.GetNodeByID(subpkg.RootElements[0]).Identifiers[int32(sbom.SoftwareIdentifierType_PURL)] = packageurl
 	}
 
 	return subpkg, nil
@@ -829,8 +829,7 @@ func (di *spdxDefaultImplementation) referenceInfoToPackage(opts *Options, img *
 // PackageFromImageTarball reads an OCI image archive and produces a SPDX
 // packafe describing its layers.
 func (di *spdxDefaultImplementation) PackageFromImageTarball(
-	spdxOpts *Options, tarPath string,
-) (imagePackage *Package, err error) {
+	spdxOpts *Options, tarPath string) (*sbom.NodeList, error) {
 	logrus.Debugf("Generating SPDX package from image tarball %s", tarPath)
 	if tarPath == "" {
 		return nil, errors.New("tar path empty")
@@ -838,6 +837,7 @@ func (di *spdxDefaultImplementation) PackageFromImageTarball(
 
 	// Extract all files from tarfile
 	tarOpts := &TarballOptions{}
+	var err error
 
 	// If specified, add individual files from the tarball to the
 	// spdx package, unless AnalyzeLayers is set because in that
@@ -872,14 +872,14 @@ func (di *spdxDefaultImplementation) PackageFromImageTarball(
 	logrus.Infof("Package describes image %s", manifest.RepoTags[0])
 
 	// Create the new SPDX package
-	imagePackage, err = di.PackageFromTarball(spdxOpts, tarOpts, tarPath)
+	imagePackage, err := di.PackageFromTarball(spdxOpts, tarOpts, tarPath)
 	if err != nil {
 		return nil, fmt.Errorf("generating package from tar archive: %w", err)
 	}
-	imagePackage.Options().WorkDir = tarOpts.ExtractDir
-	imagePackage.Name = filepath.Base(tarPath)
-	imagePackage.BuildID(manifest.RepoTags[0])
-	imagePackage.Comment = "Container image archive"
+	//imagePackage.Options().WorkDir = tarOpts.ExtractDir
+	imagePackage.GetNodeByID(imagePackage.RootElements[0]).Name = filepath.Base(tarPath)
+	//imagePackage.BuildID(manifest.RepoTags[0])
+	imagePackage.GetNodeByID(imagePackage.RootElements[0]).Comment = "Container image archive"
 	logrus.Infof("Image manifest lists %d layers", len(manifest.LayerFiles))
 
 	// Scan the container layers for OS information:
@@ -907,23 +907,19 @@ func (di *spdxDefaultImplementation) PackageFromImageTarball(
 
 	// Cycle all the layers from the manifest and add them as packages
 	for i, layerFile := range manifest.LayerFiles {
-		// Generate a package from a layer
+		// Generate a package from the layer
 		pkg, err := di.PackageFromTarball(spdxOpts, tarOpts, filepath.Join(tarOpts.ExtractDir, layerFile))
 		if err != nil {
 			return nil, fmt.Errorf("building package from layer: %w", err)
 		}
 
-		pkg.Name = "sha256:" + pkg.Checksum["SHA256"]
-		pkg.Comment = "Container image layer from archive"
-
-		// Regenerate the BuildID to avoid clashes when handling multiple
-		// images at the same time.
-		pkg.BuildID(manifest.RepoTags[0], pkg.Name)
+		pkg.GetNodeByID(pkg.RootElements[0]).Name = "sha256:" + pkg.GetNodeByID(pkg.RootElements[0]).Hashes[int32(sbom.HashAlgorithm_SHA256)]
+		pkg.GetNodeByID(pkg.RootElements[0]).Comment = "Container image layer from archive"
 
 		// If the option is enabled, scan the container layers
 		if spdxOpts.AnalyzeLayers {
 			if err := di.AnalyzeImageLayer(filepath.Join(tarOpts.ExtractDir, layerFile), pkg); err != nil {
-				return nil, fmt.Errorf("scanning layer "+pkg.ID+" :%w", err)
+				return nil, fmt.Errorf("scanning layer #%d :%w", i, err)
 			}
 		} else {
 			logrus.Debug("Not performing deep image analysis (opts.AnalyzeLayers = false)")
@@ -932,43 +928,38 @@ func (di *spdxDefaultImplementation) PackageFromImageTarball(
 		// If we got the OS data from the scanner, add the packages:
 		if i == layerNum && osPackageData != nil {
 			for i := range *osPackageData {
-				ospk := NewPackage()
+				ospk := sbom.NewNode()
 				ospk.Name = (*osPackageData)[i].Package
 				ospk.Version = (*osPackageData)[i].Version
-				ospk.HomePage = (*osPackageData)[i].HomePage
-				ospk.Originator = struct {
-					Person       string
-					Organization string
-				}{
-					Person: (*osPackageData)[i].MaintainerName,
-				}
+				ospk.UrlHome = (*osPackageData)[i].HomePage
+				ospk.Originators = append(ospk.Originators, &sbom.Person{
+					Name: (*osPackageData)[i].MaintainerName,
+				})
 				if (*osPackageData)[i].License != "" {
-					ospk.LicenseDeclared = (*osPackageData)[i].License
+					ospk.Licenses = append(ospk.Licenses, (*osPackageData)[i].License)
 				}
-				ospk.Checksum = (*osPackageData)[i].Checksums
+				ospk.Hashes = (*osPackageData)[i].Checksums
 
 				if (*osPackageData)[i].MaintainerName != "" {
-					ospk.Supplier.Person = (*osPackageData)[i].MaintainerName
-					if (*osPackageData)[i].MaintainerEmail != "" {
-						ospk.Supplier.Person += fmt.Sprintf(" (%s)", (*osPackageData)[i].MaintainerEmail)
-					}
+					ospk.Suppliers = append(ospk.Suppliers, &sbom.Person{
+						Name:  (*osPackageData)[i].MaintainerName,
+						Email: (*osPackageData)[i].MaintainerEmail,
+					})
 				}
 				if (*osPackageData)[i].PackageURL() != "" {
-					ospk.ExternalRefs = append(ospk.ExternalRefs, ExternalRef{
-						Category: CatPackageManager,
-						Type:     "purl",
-						Locator:  (*osPackageData)[i].PackageURL(),
-					})
+					ospk.Identifiers[int32(sbom.SoftwareIdentifierType_PURL)] = (*osPackageData)[i].PackageURL()
 				}
 
 				if (*osPackageData)[i].DownloadLocation() != "" {
-					ospk.DownloadLocation = (*osPackageData)[i].DownloadLocation()
+					ospk.UrlDownload = (*osPackageData)[i].DownloadLocation()
 				}
 
-				ospk.BuildID(pkg.ID)
-				if err := pkg.AddPackage(ospk); err != nil {
-					return nil, fmt.Errorf("adding OS package to container layer: %w", err)
-				}
+				ospk.Id = sbom.NewNodeIdentifier()
+				pkg.Edges = append(pkg.Edges, &sbom.Edge{
+					Type: sbom.Edge_contains,
+					From: pkg.RootElements[0],
+					To:   []string{ospk.Id}, // FIXME Collect the to avoid duplicating
+				})
 			}
 		}
 
@@ -987,8 +978,8 @@ func (di *spdxDefaultImplementation) AnalyzeImageLayer(layerPath string, pkg *Pa
 }
 
 // PackageFromDirectory scans a directory and returns its contents as a
-// SPDX package, optionally determining the licenses found.
-func (di *spdxDefaultImplementation) PackageFromDirectory(opts *Options, dirPath string) (pkg *Package, err error) {
+// SPDX package, optionally determining the licenses found
+func (di *spdxDefaultImplementation) PackageFromDirectory(opts *Options, dirPath string) (nl *sbom.NodeList, err error) {
 	dirPath, err = filepath.Abs(dirPath)
 	if err != nil {
 		return nil, fmt.Errorf("getting absolute directory path: %w", err)
@@ -1026,60 +1017,52 @@ func (di *spdxDefaultImplementation) PackageFromDirectory(opts *Options, dirPath
 	}
 	logrus.Infof("Scanning %d files and adding them to the SPDX package", len(fileList))
 
-	pkg = NewPackage()
-	pkg.FilesAnalyzed = true
-	pkg.Name = filepath.Base(dirPath)
-	if pkg.Name == "" {
-		pkg.Name = uuid.NewString()
-	}
-	pkg.LicenseConcluded = licenseTag
+	pkg := sbom.NewNodeList()
+	dir := sbom.NewNode()
+	dir.Name = filepath.Base(dirPath)
+	dir.LicenseConcluded = licenseTag
+	pkg.AddRootNode(dir)
 
 	// Set the working directory of the package:
-	pkg.Options().WorkDir = filepath.Dir(dirPath)
+	// pkg.Options().WorkDir = filepath.Dir(dirPath)
 
 	t := throttler.New(5, len(fileList))
-
-	processDirectoryFile := func(path string, pkg *Package) {
-		var (
-			err error
-			lic *license.License
-		)
-
-		f := NewFile()
-		f.Options().WorkDir = dirPath
-		f.Options().Prefix = pkg.Name
-
-		lic, err = reader.LicenseFromFile(filepath.Join(dirPath, path))
-		if err != nil {
-			t.Done(fmt.Errorf("scanning file for license: %w", err))
-			return
-		}
-
-		// If a file does not contain a license then we assume
-		// the whole repository license applies. If it has one,
-		// the we conclude that files is released under those licenses.
-		f.LicenseInfoInFile = NONE
-		if lic == nil {
-			f.LicenseConcluded = licenseTag
-		} else {
-			f.LicenseInfoInFile = lic.LicenseID
-			f.LicenseConcluded = lic.LicenseID
-		}
-
-		if err = f.ReadSourceFile(filepath.Join(dirPath, path)); err != nil {
-			t.Done(fmt.Errorf("checksumming file: %w", err))
-			return
-		}
-		if err = pkg.AddFile(f); err != nil {
-			t.Done(fmt.Errorf("adding %s as file to the spdx package: %w", path, err))
-			return
-		}
-		t.Done(nil)
-	}
-
 	// Read the files in parallel
 	for _, path := range fileList {
-		go processDirectoryFile(path, pkg)
+		go func(path string) {
+			f := sbom.NewNode()
+			f.Type = sbom.Node_FILE
+			f.Name = path // FIXME: trim dirname
+			//f.Options().WorkDir = dirPath
+
+			lic, err := reader.LicenseFromFile(filepath.Join(dirPath, path))
+			if err != nil {
+				t.Done(fmt.Errorf("scanning file for license: %w", err))
+				return
+			}
+
+			// If a file does not contain a license then we assume
+			// the whole repository license applies. If it has one,
+			// the we conclude that files is released under those licenses.
+			if lic == nil {
+				f.LicenseConcluded = licenseTag
+			} else {
+				// mmh
+				f.Licenses = append(f.Licenses, lic.LicenseID)
+				f.LicenseConcluded = lic.LicenseID
+			}
+
+			if err = readChecksums(f, filepath.Join(dirPath, path)); err != nil {
+				t.Done(fmt.Errorf("checksumming file: %w", err))
+				return
+			}
+			pkg.AddNode(f)
+			if err := pkg.RelateNodeAtID(f, dir.Id, sbom.Edge_contains); err != nil {
+				t.Done(fmt.Errorf("adding %s as file to the spdx package: %w", path, err))
+				return
+			}
+			t.Done(nil)
+		}(path)
 		t.Throttle()
 	}
 

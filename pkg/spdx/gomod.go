@@ -26,8 +26,11 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/google/uuid"
+
 	"github.com/nozzle/throttler"
 	purl "github.com/package-url/packageurl-go"
+	"github.com/protobom/protobom/pkg/sbom"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/vcs" //nolint:staticcheck
@@ -91,34 +94,30 @@ type GoPackage struct {
 	CopyrightText string
 }
 
-// SPDXPackage builds a spdx package from the go package data.
-func (pkg *GoPackage) ToSPDXPackage() (*Package, error) {
+// SPDXPackage builds a spdx package from the go package data
+func (pkg *GoPackage) ToSPDXPackage() (*sbom.Node, error) {
 	repo, err := vcs.RepoRootForImportPath(pkg.ImportPath, true)
 	if err != nil {
 		return nil, fmt.Errorf("building repository from package import path: %w", err)
 	}
-	spdxPackage := NewPackage()
-	spdxPackage.Options().Prefix = "gomod"
-	spdxPackage.Name = pkg.ImportPath
 
-	spdxPackage.BuildID(pkg.ImportPath, pkg.Revision)
+	spdxPackage := sbom.NewNode()
+	spdxPackage.Name = pkg.ImportPath
+	spdxPackage.Id = uuid.NewString()
+
 	if strings.Contains(pkg.Revision, "+incompatible") {
-		spdxPackage.DownloadLocation = repo.VCS.Scheme[0] + "+" + repo.Repo
+		spdxPackage.UrlDownload = repo.VCS.Scheme[0] + "+" + repo.Repo
 	} else {
-		spdxPackage.DownloadLocation = fmt.Sprintf(
+		spdxPackage.UrlDownload = fmt.Sprintf(
 			"https://proxy.golang.org/%s/@v/%s.zip", pkg.ImportPath,
 			strings.TrimSuffix(pkg.Revision, "+incompatible"),
 		)
 	}
 	spdxPackage.LicenseConcluded = pkg.LicenseID
 	spdxPackage.Version = strings.TrimSuffix(pkg.Revision, "+incompatible")
-	spdxPackage.CopyrightText = pkg.CopyrightText
+	spdxPackage.Copyright = pkg.CopyrightText
 	if packageurl := pkg.PackageURL(); packageurl != "" {
-		spdxPackage.ExternalRefs = append(spdxPackage.ExternalRefs, ExternalRef{
-			Category: CatPackageManager,
-			Type:     "purl",
-			Locator:  packageurl,
-		})
+		spdxPackage.Identifiers[int32(sbom.SoftwareIdentifierType_PURL)] = packageurl
 	}
 	return spdxPackage, nil
 }
